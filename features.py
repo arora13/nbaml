@@ -9,7 +9,7 @@ def team_to_game_rows(team_rows: pd.DataFrame) -> pd.DataFrame:
     """
     tr = team_rows.copy()
 
-    # Ensure MATCHUP is a string and handle missing values safely
+    # safe home/away flag
     tr["MATCHUP"] = tr["MATCHUP"].astype(str)
     tr["IS_HOME"] = tr["MATCHUP"].str.contains(" vs. ", na=False)
 
@@ -25,24 +25,32 @@ def team_to_game_rows(team_rows: pd.DataFrame) -> pd.DataFrame:
     )
     game = game.rename(columns={"TEAM_ID_HOME":"HOME_ID","TEAM_ID_AWAY":"AWAY_ID"})
     game["HOME_WIN"] = (game["WL"] == "W").astype(int)
-
-    # Keep a stable sort
     return game.sort_values("GAME_DATE").reset_index(drop=True)
 
 def add_rolling(team_rows: pd.DataFrame, window=10) -> pd.DataFrame:
     """
-    Compute shifted rolling means so we use only information prior to each game (no leakage).
+    Shifted rolling means so we only use info prior to each game.
     """
     tr = team_rows.sort_values(["TEAM_ID","GAME_DATE"]).copy()
     metrics = ["PTS","AST","REB","TOV","FG_PCT","FG3_PCT","FT_PCT","PLUS_MINUS"]
-
     for m in metrics:
         tr[f"{m}_R{window}"] = (
             tr.groupby("TEAM_ID")[m]
               .transform(lambda s: s.shift(1).rolling(window, min_periods=3).mean())
         )
-
     tr["GAMES_PLAYED"] = tr.groupby("TEAM_ID").cumcount()
+    return tr
+
+def add_rest(team_rows: pd.DataFrame) -> pd.DataFrame:
+    """
+    Rest features per team row:
+      - REST_DAYS: days since previous game
+      - B2B: 1 if REST_DAYS == 1, else 0
+    """
+    tr = team_rows.sort_values(["TEAM_ID","GAME_DATE"]).copy()
+    last_date = tr.groupby("TEAM_ID")["GAME_DATE"].shift(1)
+    tr["REST_DAYS"] = (tr["GAME_DATE"] - last_date).dt.days
+    tr["B2B"] = (tr["REST_DAYS"] == 1).astype("Int64").astype(float)
     return tr
 
 def add_elo(game_rows: pd.DataFrame, k=20, home_adv=65) -> pd.DataFrame:
@@ -75,45 +83,57 @@ def add_elo(game_rows: pd.DataFrame, k=20, home_adv=65) -> pd.DataFrame:
 def build_dataset(team_rows: pd.DataFrame) -> pd.DataFrame:
     """
     Master dataset builder:
-    - Rolling team form (R10) joined onto game rows for home/away
-    - Elo features
-    - Calendar features
-    - Differentials (home - away) for rolling stats and Elo
+    - Rolling team form (R10)
+    - Rest and back to back
+    - Game rows with home/away split
+    - Elo, calendar, differentials
     """
-    # Rolling stats per team, shifted
-    tr = add_rolling(team_rows, window=10)
+    # rolling and rest on team rows
+    tr_roll = add_rolling(team_rows, window=10)
+    tr_rest = add_rest(team_rows)
 
-    # Game rows (home/away split + result)
+    # game rows
     game = team_to_game_rows(team_rows)
 
-    # Join rolling features for home and away
+    # join rolling features
     base = ["TEAM_ID","GAME_ID"]
-    roll_cols = [c for c in tr.columns if c.endswith("_R10")]
+    roll_cols = [c for c in tr_roll.columns if c.endswith("_R10")]
+    home_roll = tr_roll[base + roll_cols].rename(columns={"TEAM_ID":"HOME_ID"})
+    home_roll = home_roll.rename(columns={c: f"{c}_HOME" for c in roll_cols})
+    away_roll = tr_roll[base + roll_cols].rename(columns={"TEAM_ID":"AWAY_ID"})
+    away_roll = away_roll.rename(columns={c: f"{c}_AWAY" for c in roll_cols})
 
-    home = tr[base + roll_cols].rename(columns={"TEAM_ID":"HOME_ID"})
-    home = home.rename(columns={c: f"{c}_HOME" for c in roll_cols})
+    df = game.merge(home_roll, on=["GAME_ID","HOME_ID"], how="left")
+    df = df.merge(away_roll, on=["GAME_ID","AWAY_ID"], how="left")
 
-    away = tr[base + roll_cols].rename(columns={"TEAM_ID":"AWAY_ID"})
-    away = away.rename(columns={c: f"{c}_AWAY" for c in roll_cols})
+    # join rest features
+    rest_cols = ["TEAM_ID","GAME_ID","REST_DAYS","B2B"]
+    home_rest = tr_rest[rest_cols].rename(
+        columns={"TEAM_ID":"HOME_ID","REST_DAYS":"REST_HOME","B2B":"B2B_HOME"}
+    )
+    away_rest = tr_rest[rest_cols].rename(
+        columns={"TEAM_ID":"AWAY_ID","REST_DAYS":"REST_AWAY","B2B":"B2B_AWAY"}
+    )
+    df = df.merge(home_rest, on=["GAME_ID","HOME_ID"], how="left")
+    df = df.merge(away_rest, on=["GAME_ID","AWAY_ID"], how="left")
 
-    df = game.merge(home, on=["GAME_ID","HOME_ID"], how="left")
-    df = df.merge(away, on=["GAME_ID","AWAY_ID"], how="left")
-
-    # Elo features
+    # Elo
     df = add_elo(df)
 
-    # Calendar context
+    # calendar
     df["DOW"] = df["GAME_DATE"].dt.dayofweek
     df["MONTH"] = df["GAME_DATE"].dt.month
 
-    # Drop rows with NaNs from early-season rolling gaps
+    # drop early NaNs
     df = df.dropna().reset_index(drop=True)
 
-    # Rolling differentials (home - away)
+    # differentials for rolling and Elo
     for m in ["PTS","AST","REB","TOV","FG_PCT","FG3_PCT","FT_PCT","PLUS_MINUS"]:
         df[f"{m}_DIFF_R10"] = df[f"{m}_R10_HOME"] - df[f"{m}_R10_AWAY"]
-
-    # Elo differential
     df["ELO_DIFF"] = df["HOME_ELO_PRE"] - df["AWAY_ELO_PRE"]
+
+    # rest/b2b differentials
+    df["REST_DIFF"] = df["REST_HOME"] - df["REST_AWAY"]
+    df["B2B_DIFF"] = df["B2B_HOME"] - df["B2B_AWAY"]
 
     return df
