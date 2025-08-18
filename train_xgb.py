@@ -28,12 +28,15 @@ def fetch_games(start_season: int, end_season: int) -> pd.DataFrame:
 
 def build_Xy(df: pd.DataFrame):
     y = df["HOME_WIN"].astype(int).values
-    base = ["HOME_ELO_PRE","AWAY_ELO_PRE","HOME_ELO_EXP","ELO_DIFF",
-            "DOW","MONTH",
-            "REST_HOME","REST_AWAY","B2B_HOME","B2B_AWAY","REST_DIFF","B2B_DIFF"]
-    diffs = [c for c in df.columns if c.endswith("_DIFF_R10")]
+    base = [
+        "HOME_ELO_PRE","AWAY_ELO_PRE","HOME_ELO_EXP","ELO_DIFF",
+        "DOW","MONTH",
+        "REST_HOME","REST_AWAY","B2B_HOME","B2B_AWAY","REST_DIFF","B2B_DIFF"
+    ]
+    diffs = [c for c in df.columns if c.endswith("_DIFF_R10") or c.endswith("_DIFF_R30") or c.endswith("_DIFF_SDT")]
     X = df[base + diffs].copy()
-    return X, y, base + diffs
+    return X, y, base + diffs if "return 3" in build_Xy.__code__.co_consts else (X, y)
+
 
 def split_by_season(df: pd.DataFrame, holdout: int):
     train_df = df[~df["SEASON_ID"].astype(str).str.contains(str(holdout))].copy()

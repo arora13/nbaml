@@ -29,15 +29,35 @@ def team_to_game_rows(team_rows: pd.DataFrame) -> pd.DataFrame:
 
 def add_rolling(team_rows: pd.DataFrame, window=10) -> pd.DataFrame:
     """
-    Shifted rolling means so we only use info prior to each game.
+    Rolling means per team, shifted (no leakage).
+    Adds:
+      - R10  (last 10 games)
+      - R30  (last 30 games)
+      - SDT  (season-to-date expanding mean)
     """
     tr = team_rows.sort_values(["TEAM_ID","GAME_DATE"]).copy()
     metrics = ["PTS","AST","REB","TOV","FG_PCT","FG3_PCT","FT_PCT","PLUS_MINUS"]
+
+    # R10
     for m in metrics:
-        tr[f"{m}_R{window}"] = (
+        tr[f"{m}_R10"] = (
             tr.groupby("TEAM_ID")[m]
-              .transform(lambda s: s.shift(1).rolling(window, min_periods=3).mean())
+              .transform(lambda s: s.shift(1).rolling(10, min_periods=3).mean())
         )
+    # R30
+    for m in metrics:
+        tr[f"{m}_R30"] = (
+            tr.groupby("TEAM_ID")[m]
+              .transform(lambda s: s.shift(1).rolling(30, min_periods=5).mean())
+        )
+    # Season-to-date expanding mean (reset each season)
+    tr["SEASON_KEY"] = tr["SEASON_ID"].astype(str)
+    for m in metrics:
+        tr[f"{m}_SDT"] = (
+            tr.groupby(["TEAM_ID","SEASON_KEY"])[m]
+              .transform(lambda s: s.shift(1).expanding(min_periods=3).mean())
+        )
+
     tr["GAMES_PLAYED"] = tr.groupby("TEAM_ID").cumcount()
     return tr
 
@@ -83,21 +103,19 @@ def add_elo(game_rows: pd.DataFrame, k=20, home_adv=65) -> pd.DataFrame:
 def build_dataset(team_rows: pd.DataFrame) -> pd.DataFrame:
     """
     Master dataset builder:
-    - Rolling team form (R10)
+    - Rolling team form (R10, R30, SDT)
     - Rest and back to back
     - Game rows with home/away split
     - Elo, calendar, differentials
     """
-    # rolling and rest on team rows
-    tr_roll = add_rolling(team_rows, window=10)
+    tr_roll = add_rolling(team_rows)
     tr_rest = add_rest(team_rows)
 
-    # game rows
     game = team_to_game_rows(team_rows)
 
-    # join rolling features
     base = ["TEAM_ID","GAME_ID"]
-    roll_cols = [c for c in tr_roll.columns if c.endswith("_R10")]
+    roll_cols = [c for c in tr_roll.columns if c.endswith("_R10") or c.endswith("_R30") or c.endswith("_SDT")]
+
     home_roll = tr_roll[base + roll_cols].rename(columns={"TEAM_ID":"HOME_ID"})
     home_roll = home_roll.rename(columns={c: f"{c}_HOME" for c in roll_cols})
     away_roll = tr_roll[base + roll_cols].rename(columns={"TEAM_ID":"AWAY_ID"})
@@ -106,14 +124,10 @@ def build_dataset(team_rows: pd.DataFrame) -> pd.DataFrame:
     df = game.merge(home_roll, on=["GAME_ID","HOME_ID"], how="left")
     df = df.merge(away_roll, on=["GAME_ID","AWAY_ID"], how="left")
 
-    # join rest features
+    # rest features
     rest_cols = ["TEAM_ID","GAME_ID","REST_DAYS","B2B"]
-    home_rest = tr_rest[rest_cols].rename(
-        columns={"TEAM_ID":"HOME_ID","REST_DAYS":"REST_HOME","B2B":"B2B_HOME"}
-    )
-    away_rest = tr_rest[rest_cols].rename(
-        columns={"TEAM_ID":"AWAY_ID","REST_DAYS":"REST_AWAY","B2B":"B2B_AWAY"}
-    )
+    home_rest = tr_rest[rest_cols].rename(columns={"TEAM_ID":"HOME_ID","REST_DAYS":"REST_HOME","B2B":"B2B_HOME"})
+    away_rest = tr_rest[rest_cols].rename(columns={"TEAM_ID":"AWAY_ID","REST_DAYS":"REST_AWAY","B2B":"B2B_AWAY"})
     df = df.merge(home_rest, on=["GAME_ID","HOME_ID"], how="left")
     df = df.merge(away_rest, on=["GAME_ID","AWAY_ID"], how="left")
 
@@ -127,12 +141,14 @@ def build_dataset(team_rows: pd.DataFrame) -> pd.DataFrame:
     # drop early NaNs
     df = df.dropna().reset_index(drop=True)
 
-    # differentials for rolling and Elo
-    for m in ["PTS","AST","REB","TOV","FG_PCT","FG3_PCT","FT_PCT","PLUS_MINUS"]:
-        df[f"{m}_DIFF_R10"] = df[f"{m}_R10_HOME"] - df[f"{m}_R10_AWAY"]
-    df["ELO_DIFF"] = df["HOME_ELO_PRE"] - df["AWAY_ELO_PRE"]
+    # differentials for each window (R10, R30, SDT)
+    stat_list = ["PTS","AST","REB","TOV","FG_PCT","FG3_PCT","FT_PCT","PLUS_MINUS"]
+    for m in stat_list:
+        for suffix in ["R10","R30","SDT"]:
+            df[f"{m}_DIFF_{suffix}"] = df[f"{m}_{suffix}_HOME"] - df[f"{m}_{suffix}_AWAY"]
 
-    # rest/b2b differentials
+    # Elo + rest diffs
+    df["ELO_DIFF"] = df["HOME_ELO_PRE"] - df["AWAY_ELO_PRE"]
     df["REST_DIFF"] = df["REST_HOME"] - df["REST_AWAY"]
     df["B2B_DIFF"] = df["B2B_HOME"] - df["B2B_AWAY"]
 
