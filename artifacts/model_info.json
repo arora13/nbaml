@@ -1,0 +1,19 @@
+{
+  "model": "HistGradientBoostingClassifier",
+  "feature_count": 62,
+  "holdout_season": 2024,
+  "features_sample": [
+    "HOME_ELO_PRE",
+    "AWAY_ELO_PRE",
+    "HOME_ELO_EXP",
+    "ELO_DIFF",
+    "DOW",
+    "MONTH",
+    "REST_HOME",
+    "REST_AWAY",
+    "B2B_HOME",
+    "B2B_AWAY",
+    "REST_DIFF",
+    "B2B_DIFF"
+  ]
+}

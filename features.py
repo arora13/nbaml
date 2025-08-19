@@ -1,6 +1,21 @@
 # features.py
-import pandas as pd
 import numpy as np
+import pandas as pd
+
+_NUMERIC_EXCEPT = {
+    "SEASON_ID", "GAME_ID", "MATCHUP", "WL",
+    "TEAM_ABBREVIATION", "TEAM_NAME"
+}
+def _coerce_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert all non-text columns to numeric; parse GAME_DATE."""
+    out = df.copy()
+    if "GAME_DATE" in out.columns:
+        out["GAME_DATE"] = pd.to_datetime(out["GAME_DATE"], errors="coerce")
+    for c in out.columns:
+        if c == "GAME_DATE" or c in _NUMERIC_EXCEPT:
+            continue
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    return out
 
 def team_to_game_rows(team_rows: pd.DataFrame) -> pd.DataFrame:
     """
@@ -103,53 +118,111 @@ def add_elo(game_rows: pd.DataFrame, k=20, home_adv=65) -> pd.DataFrame:
 def build_dataset(team_rows: pd.DataFrame) -> pd.DataFrame:
     """
     Master dataset builder:
-    - Rolling team form (R10, R30, SDT)
-    - Rest and back to back
-    - Game rows with home/away split
-    - Elo, calendar, differentials
+      - Type coercion (prevents string arithmetic errors)
+      - Rolling team form (R10, R30, SDT) via add_rolling(...)
+      - Rest & back-to-back, plus rolling-5 rest/B2B rate
+      - Game rows (home/away split) via team_to_game_rows(...)
+      - Elo + calendar features
+      - Home–away differentials
     """
-    tr_roll = add_rolling(team_rows)
-    tr_rest = add_rest(team_rows)
+    # 0) types first (avoids 'str - str' TypeError)
+    tr = _coerce_numeric_columns(team_rows)
 
-    game = team_to_game_rows(team_rows)
+    # 1) per-team feature tables
+    tr_roll = add_rolling(tr)          # expects numeric inputs; returns ..._R10/_R30/_SDT
+    tr_rest = add_rest(tr)             # returns TEAM_ID, GAME_ID, REST_DAYS, B2B, (maybe GAME_DATE)
 
-    base = ["TEAM_ID","GAME_ID"]
-    roll_cols = [c for c in tr_roll.columns if c.endswith("_R10") or c.endswith("_R30") or c.endswith("_SDT")]
+    # ensure GAME_DATE present in tr_rest for chronological rolling
+    if "GAME_DATE" not in tr_rest.columns:
+        tr_rest = tr_rest.merge(tr[["TEAM_ID", "GAME_ID", "GAME_DATE"]],
+                                on=["TEAM_ID", "GAME_ID"], how="left")
 
-    home_roll = tr_roll[base + roll_cols].rename(columns={"TEAM_ID":"HOME_ID"})
+    # rolling-5 rest features (per team, in time order)
+    tr_rest = tr_rest.sort_values(["TEAM_ID", "GAME_DATE"])
+    g = tr_rest.groupby("TEAM_ID", group_keys=False)
+    tr_rest["REST_R5"]       = g["REST_DAYS"].rolling(5, min_periods=1).mean().reset_index(level=0, drop=True)
+    tr_rest["B2B_RATE_R5"]   = g["B2B"].rolling(5, min_periods=1).mean().reset_index(level=0, drop=True)
+
+    # 2) game-level scaffold (must include HOME_ID, AWAY_ID, GAME_ID, GAME_DATE, SEASON_ID, HOME_WIN)
+    game = team_to_game_rows(tr).copy()
+
+    # 3) join rolling form (home/away)
+    base_keys = ["TEAM_ID", "GAME_ID"]
+    roll_cols = [c for c in tr_roll.columns if c.endswith(("_R10", "_R30", "_SDT"))]
+
+    home_roll = tr_roll[base_keys + roll_cols].rename(columns={"TEAM_ID": "HOME_ID"})
     home_roll = home_roll.rename(columns={c: f"{c}_HOME" for c in roll_cols})
-    away_roll = tr_roll[base + roll_cols].rename(columns={"TEAM_ID":"AWAY_ID"})
+
+    away_roll = tr_roll[base_keys + roll_cols].rename(columns={"TEAM_ID": "AWAY_ID"})
     away_roll = away_roll.rename(columns={c: f"{c}_AWAY" for c in roll_cols})
 
-    df = game.merge(home_roll, on=["GAME_ID","HOME_ID"], how="left")
-    df = df.merge(away_roll, on=["GAME_ID","AWAY_ID"], how="left")
+    df = game.merge(home_roll, on=["GAME_ID", "HOME_ID"], how="left")
+    df = df.merge(away_roll, on=["GAME_ID", "AWAY_ID"], how="left")
 
-    # rest features
-    rest_cols = ["TEAM_ID","GAME_ID","REST_DAYS","B2B"]
-    home_rest = tr_rest[rest_cols].rename(columns={"TEAM_ID":"HOME_ID","REST_DAYS":"REST_HOME","B2B":"B2B_HOME"})
-    away_rest = tr_rest[rest_cols].rename(columns={"TEAM_ID":"AWAY_ID","REST_DAYS":"REST_AWAY","B2B":"B2B_AWAY"})
-    df = df.merge(home_rest, on=["GAME_ID","HOME_ID"], how="left")
-    df = df.merge(away_rest, on=["GAME_ID","AWAY_ID"], how="left")
+    # 4) join rest/B2B (including rolling-5)
+    rest_cols = ["TEAM_ID", "GAME_ID", "REST_DAYS", "B2B", "REST_R5", "B2B_RATE_R5"]
+    home_rest = tr_rest[rest_cols].rename(columns={
+        "TEAM_ID": "HOME_ID",
+        "REST_DAYS": "REST_HOME",
+        "B2B": "B2B_HOME",
+        "REST_R5": "REST_R5_HOME",
+        "B2B_RATE_R5": "B2B_RATE_R5_HOME",
+    })
+    away_rest = tr_rest[rest_cols].rename(columns={
+        "TEAM_ID": "AWAY_ID",
+        "REST_DAYS": "REST_AWAY",
+        "B2B": "B2B_AWAY",
+        "REST_R5": "REST_R5_AWAY",
+        "B2B_RATE_R5": "B2B_RATE_R5_AWAY",
+    })
+    df = df.merge(home_rest, on=["GAME_ID", "HOME_ID"], how="left")
+    df = df.merge(away_rest, on=["GAME_ID", "AWAY_ID"], how="left")
 
-    # Elo
+    # 5) Elo (adds HOME_ELO_PRE / AWAY_ELO_PRE; we also compute expectation & diff)
     df = add_elo(df)
+    # if add_elo already provides HOME_ELO_EXP, this will overwrite with same logic
+    Rh = pd.to_numeric(df.get("HOME_ELO_PRE", 1500), errors="coerce").fillna(1500)
+    Ra = pd.to_numeric(df.get("AWAY_ELO_PRE", 1500), errors="coerce").fillna(1500)
+    home_adv = 65.0  # ~standard NBA HFA in Elo points
+    df["HOME_ELO_EXP"] = 1.0 / (1.0 + 10 ** (-(Rh + home_adv - Ra) / 400.0))
+    df["ELO_DIFF"] = Rh - Ra
 
-    # calendar
+    # 6) calendar features
+    df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"], errors="coerce")
     df["DOW"] = df["GAME_DATE"].dt.dayofweek
     df["MONTH"] = df["GAME_DATE"].dt.month
 
-    # drop early NaNs
-    df = df.dropna().reset_index(drop=True)
+    # 7) engineered differentials (only if both sides exist)
+    windows = ["R10", "R30", "SDT"]
+    stats = ["PTS", "AST", "REB", "TOV", "FG_PCT", "FG3_PCT", "FT_PCT", "PLUS_MINUS"]
+    for s in stats:
+        for w in windows:
+            hcol = f"{s}_{w}_HOME"
+            acol = f"{s}_{w}_AWAY"
+            dcol = f"{s}_DIFF_{w}"
+            if hcol in df.columns and acol in df.columns:
+                df[dcol] = pd.to_numeric(df[hcol], errors="coerce") - pd.to_numeric(df[acol], errors="coerce")
 
-    # differentials for each window (R10, R30, SDT)
-    stat_list = ["PTS","AST","REB","TOV","FG_PCT","FG3_PCT","FT_PCT","PLUS_MINUS"]
-    for m in stat_list:
-        for suffix in ["R10","R30","SDT"]:
-            df[f"{m}_DIFF_{suffix}"] = df[f"{m}_{suffix}_HOME"] - df[f"{m}_{suffix}_AWAY"]
+    # 8) rest/b2b differentials
+    df["REST_DIFF"] = pd.to_numeric(df.get("REST_HOME"), errors="coerce") - pd.to_numeric(df.get("REST_AWAY"), errors="coerce")
+    df["B2B_DIFF"] = pd.to_numeric(df.get("B2B_HOME"), errors="coerce") - pd.to_numeric(df.get("B2B_AWAY"), errors="coerce")
+    df["REST_R5_DIFF"] = pd.to_numeric(df.get("REST_R5_HOME"), errors="coerce") - pd.to_numeric(df.get("REST_R5_AWAY"), errors="coerce")
+    df["B2B_RATE_R5_DIFF"] = pd.to_numeric(df.get("B2B_RATE_R5_HOME"), errors="coerce") - pd.to_numeric(df.get("B2B_RATE_R5_AWAY"), errors="coerce")
 
-    # Elo + rest diffs
-    df["ELO_DIFF"] = df["HOME_ELO_PRE"] - df["AWAY_ELO_PRE"]
-    df["REST_DIFF"] = df["REST_HOME"] - df["REST_AWAY"]
-    df["B2B_DIFF"] = df["B2B_HOME"] - df["B2B_AWAY"]
+    # 9) ensure target exists (team_to_game_rows should provide HOME_WIN)
+    if "HOME_WIN" not in df.columns:
+        # try to infer from per-game plus/minus if present
+        if "HOME_PLUS_MINUS" in df.columns:
+            df["HOME_WIN"] = (pd.to_numeric(df["HOME_PLUS_MINUS"], errors="coerce") > 0).astype(int)
+        elif {"HOME_PTS", "AWAY_PTS"}.issubset(df.columns):
+            df["HOME_WIN"] = (pd.to_numeric(df["HOME_PTS"], errors="coerce") >
+                              pd.to_numeric(df["AWAY_PTS"], errors="coerce")).astype(int)
+        else:
+            # last resort: drop rows without target later; but keep column for pipeline
+            df["HOME_WIN"] = np.nan
+
+    # 10) final tidy: drop rows missing essentials
+    essentials = ["GAME_ID", "HOME_ID", "AWAY_ID", "GAME_DATE", "HOME_ELO_PRE", "AWAY_ELO_PRE", "HOME_WIN"]
+    df = df.dropna(subset=[c for c in essentials if c in df.columns]).reset_index(drop=True)
 
     return df
