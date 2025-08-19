@@ -6,3 +6,5 @@ matplotlib
 flask
 
 optuna==3.6.1
+
+pytest
