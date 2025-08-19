@@ -252,19 +252,20 @@ def best_lineup_by_minutes(team_id: int, season_str: str, top_n: int = 5) -> Lis
         return []
 
 def top_scorer_pick(team_id_a: int, team_id_b: int, season_str: str):
-    """Return (player_name, team_name, ppg, reason_text)."""
+    import os
+    if os.getenv("PREDICT_SKIP_PLAYERS") == "1":
+        return None, None, None, "Skipped for CI"
     try:
-        A = leaguedashplayerstats.LeagueDashPlayerStats(
-            season=season_str, per_mode_detailed="PerGame", team_id_nullable=team_id_a
-        ).get_data_frames()[0][["PLAYER_NAME","PTS","MIN"]]
-        B = leaguedashplayerstats.LeagueDashPlayerStats(
-            season=season_str, per_mode_detailed="PerGame", team_id_nullable=team_id_b
-        ).get_data_frames()[0][["PLAYER_NAME","PTS","MIN"]]
-        A["TEAM"] = team_name(team_id_a); B["TEAM"] = team_name(team_id_b)
-        both = pd.concat([A,B], ignore_index=True).dropna(subset=["PTS"])
-        best = both.sort_values(["PTS","MIN"], ascending=[False,False]).iloc[0]
-        reason = f"{best['PLAYER_NAME']} leads these teams in season PPG ({best['PTS']:.1f})"
-        return str(best["PLAYER_NAME"]), str(best["TEAM"]), float(best["PTS"]), reason
+        # Simple league-wide pull (ok for demo); CI will skip this path.
+        df = leaguedashplayerstats.LeagueDashPlayerStats(
+            season=season_str, per_mode_detailed="PerGame"
+        ).get_data_frames()[0]
+        # Keep it simple: pick top PPG among the two teams if present, else overall top.
+        df = df[["PLAYER_NAME","TEAM_ID","PTS","MIN","GP"]].copy()
+        subset = df[df["TEAM_ID"].isin([team_id_a, team_id_b])]
+        use = subset if not subset.empty else df
+        best = use.sort_values(["PTS","MIN","GP"], ascending=[False, False, False]).iloc[0]
+        return str(best["PLAYER_NAME"]), team_name(int(best.get("TEAM_ID", team_id_a))), float(best["PTS"]), "Season PPG leader (approx)"
     except Exception:
         return None, None, None, "Season player stats unavailable (API)."
 
