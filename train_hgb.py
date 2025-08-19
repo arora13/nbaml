@@ -13,6 +13,17 @@ from features import build_dataset
 ART = Path("artifacts"); ART.mkdir(exist_ok=True)
 DATA = Path("data/games.csv")
 
+def _load_best_params() -> dict:
+    path = ART / "hgb_optuna.json"
+    if path.exists():
+        try:
+            import json
+            best = json.loads(path.read_text())
+            return best
+        except Exception:
+            pass
+    return {}  # fall back to hardcoded defaults
+
 def load_team_rows_from_csv(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
     df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"], errors="coerce")
