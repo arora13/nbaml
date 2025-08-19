@@ -1,76 +1,94 @@
-# train_hgb.py
+# train_hgb.py (robust to missing columns)
 import json
 from pathlib import Path
+
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import accuracy_score, roc_auc_score, brier_score_loss, log_loss
+from joblib import dump
 
-from nba_api.stats.endpoints import leaguegamefinder
-from features import build_dataset
+from features import build_dataset  # your pipeline
 
 ART = Path("artifacts")
 ART.mkdir(exist_ok=True)
 
-# -------- data fetch (same as LR/XGB) --------
-def fetch_games(start_season: int, end_season: int) -> pd.DataFrame:
-    frames = []
-    for season in range(start_season, end_season + 1):
-        season_str = f"{season}-{str(season+1)[-2:]}"
-        df = leaguegamefinder.LeagueGameFinder(season_nullable=season_str).get_data_frames()[0]
-        df = df[df["SEASON_ID"].astype(str).str.contains("2")].copy()
-        frames.append(df)
-    games = pd.concat(frames, ignore_index=True)
-    games["GAME_DATE"] = pd.to_datetime(games["GAME_DATE"])
+DATA_CSV = Path("data/games.csv")
+
+def load_team_rows_from_csv(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"], errors="coerce")
+    df["TEAM_ID"] = pd.to_numeric(df["TEAM_ID"], errors="coerce").astype("Int64")
+    df = df.dropna(subset=["GAME_DATE", "TEAM_ID", "MATCHUP", "WL"]).copy()
+    df["TEAM_ID"] = df["TEAM_ID"].astype(int)
     keep = [
         "SEASON_ID","GAME_ID","GAME_DATE","MATCHUP","WL","TEAM_ID",
-        "PTS","AST","REB","TOV","FG_PCT","FG3_PCT","FT_PCT","PLUS_MINUS"
+        "PTS","FGM","FGA","FG_PCT","FG3M","FG3A","FG3_PCT","FTM","FTA","FT_PCT",
+        "OREB","DREB","REB","AST","TOV","STL","BLK","PF","PLUS_MINUS"
     ]
-    return games[keep].sort_values("GAME_DATE").reset_index(drop=True)
+    for col in keep:
+        if col not in df.columns:
+            df[col] = pd.NA
+    return df[keep].sort_values("GAME_DATE").reset_index(drop=True)
 
-# -------- features -> X, y --------
 def build_Xy(df: pd.DataFrame):
     y = df["HOME_WIN"].astype(int).values
-    base = [
+
+    # Base features we try to use; if some are missing, we’ll create them as 0s.
+    base_wanted = [
         "HOME_ELO_PRE","AWAY_ELO_PRE","HOME_ELO_EXP","ELO_DIFF",
         "DOW","MONTH",
         "REST_HOME","REST_AWAY","B2B_HOME","B2B_AWAY","REST_DIFF","B2B_DIFF",
+        "REST_R5_HOME","REST_R5_AWAY","B2B_RATE_R5_HOME","B2B_RATE_R5_AWAY",
+        "REST_R5_DIFF","B2B_RATE_R5_DIFF"
     ]
-    diffs = [c for c in df.columns if (
-        c.endswith("_DIFF_R10") or c.endswith("_DIFF_R30") or c.endswith("_DIFF_SDT")
-    )]
-    X = df[base + diffs].copy()
+    # Add any missing base columns as zeros
+    for col in base_wanted:
+        if col not in df.columns:
+            df[col] = 0.0
+
+    # Rolling differentials: include whatever exists among R10/R30/SDT
+    diff_cols = []
+    for c in df.columns:
+        if c.endswith("_DIFF_R10") or c.endswith("_DIFF_R30") or c.endswith("_DIFF_SDT"):
+            diff_cols.append(c)
+
+    X = df[base_wanted + diff_cols].copy()
     return X, y
 
-def split_by_season(df: pd.DataFrame, holdout: int):
-    train_df = df[~df["SEASON_ID"].astype(str).str.contains(str(holdout))].copy()
-    test_df  = df[ df["SEASON_ID"].astype(str).str.contains(str(holdout))].copy()
+def split_by_season(df: pd.DataFrame, holdout_start: int):
+    s = df["SEASON_ID"].astype(str)
+    train_df = df[~s.str.contains(str(holdout_start))].copy()
+    test_df  = df[ s.str.contains(str(holdout_start))].copy()
     return train_df, test_df
 
-def main(start_season=2018, end_season=2024, holdout=2024):
-    raw = fetch_games(start_season, end_season)
-    data = build_dataset(raw)
-    tr, te = split_by_season(data, holdout)
+def main(holdout=2024):
+    # 1) Load team game logs
+    team_rows = load_team_rows_from_csv(DATA_CSV)
 
-    # time-aware (already sorted by GAME_DATE inside build_dataset merges, but re-sort to be safe)
-    tr = tr.sort_values("GAME_DATE").reset_index(drop=True)
-    te = te.sort_values("GAME_DATE").reset_index(drop=True)
+    # 2) Build engineered dataset (game-level, HOME_WIN target)
+    dataset = build_dataset(team_rows)
 
-    # small tail slice of train as validation via early_stopping built into HGB
+    # 3) Time-aware split
+    tr, te = split_by_season(dataset, holdout_start=holdout)
+
+    # 4) Features/labels
     Xtr, ytr = build_Xy(tr)
     Xte, yte = build_Xy(te)
 
+    # 5) Train HGB
     clf = HistGradientBoostingClassifier(
         loss="log_loss",
         learning_rate=0.06,
         max_depth=6,
         max_iter=900,
         l2_regularization=0.0,
-        validation_fraction=0.12,   # last ~12% of training used as val
+        validation_fraction=0.12,
         early_stopping=True,
-        random_state=42
+        random_state=42,
     )
     clf.fit(Xtr, ytr)
 
+    # 6) Evaluate
     proba = clf.predict_proba(Xte)[:, 1]
     pred  = (proba >= 0.5).astype(int)
 
@@ -85,6 +103,10 @@ def main(start_season=2018, end_season=2024, holdout=2024):
     }
     print(json.dumps(metrics, indent=2))
     (ART / "hgb_metrics.json").write_text(json.dumps(metrics, indent=2))
+
+    # 7) Save model
+    dump(clf, ART / "hgb_model.joblib")
+    print("✅ Saved model to artifacts/hgb_model.joblib")
 
 if __name__ == "__main__":
     main()
