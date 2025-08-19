@@ -4,7 +4,7 @@ import sys
 import json
 from pathlib import Path
 from datetime import date
-from typing import Optional
+from typing import Optional, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -17,11 +17,23 @@ from features import build_dataset  # your engineered features
 ART = Path("artifacts")
 DATA_CSV = Path("data/games.csv")
 
+# -------- optional pretty printing --------
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich import box
+    RICH = True
+    console = Console()
+except Exception:
+    RICH = False
+    console = None
+
 # ---------------- Parsing ----------------
 SEASON_RE = re.compile(r'(\d{4})\s*[-/]\s*(\d{4})')
 DATE_RE = re.compile(r'\d{4}-\d{2}-\d{2}')
 
-def parse_query(args: list) -> str:
+def parse_query(args: List[str]) -> str:
     if len(args) == 1:
         return args[0]
     if len(args) >= 2:
@@ -43,7 +55,6 @@ def parse_query_text(q: str):
     parts = re.split(r'\bvs\b|@', q, flags=re.IGNORECASE)
     if len(parts) < 2:
         raise ValueError("Could not split teams.")
-
     left, right = parts[0].strip(), parts[1].strip()
 
     # optional date
@@ -62,15 +73,8 @@ def parse_query_text(q: str):
         season_start = min(a, b)
         season_str = f"{season_start}-{str(season_start+1)[-2:]}"
 
-    # strip date/season tokens from team strings
     clean_right = re.sub(SEASON_RE, '', re.sub(DATE_RE, '', right)).strip()
-
-    # resolve home/away
-    if sep == 'vs':
-        home_name, away_name = left, clean_right
-    else:  # '@' means left is away at right
-        home_name, away_name = clean_right, left
-
+    home_name, away_name = (left, clean_right) if sep == 'vs' else (clean_right, left)
     return home_name, away_name, dt, season_start, season_str
 
 # ---------------- Data loading ----------------
@@ -193,34 +197,52 @@ def synthesize_matchup_row(ds: pd.DataFrame, hid: int, aid: int, tgt_date: Optio
     return pd.DataFrame([out])
 
 # ---------------- Model utils ----------------
+from joblib import load
+ART = Path("artifacts")
+
 def load_best_model():
     hgb = ART / "hgb_model.joblib"
+    iso = ART / "isotonic.joblib"
     if hgb.exists():
-        return "hgb", load(hgb), None
+        model = load(hgb)
+        calibrator = load(iso) if iso.exists() else None
+        return "hgb", model, None, calibrator
     lr, sc = ART / "model.joblib", ART / "scaler.joblib"
     if lr.exists() and sc.exists():
-        return "lr", load(lr), load(sc)
-    raise RuntimeError("No trained model found. Train first: python train_hgb.py (or train.py).")
+        return "lr", load(lr), load(sc), None
+    raise RuntimeError("No trained model found. Train first: python train_hgb.py")
 
 def align_to_model(X: pd.DataFrame, model):
-    """
-    Ensure X has the exact same columns/order as during training.
-    Uses sklearn's feature_names_in_ (available for models trained with pandas DataFrames).
-    """
     if not hasattr(model, "feature_names_in_"):
-        # best effort: keep as-is
         return X
     expected = list(model.feature_names_in_)
     for col in expected:
         if col not in X.columns:
             X[col] = 0.0
-    # drop any extra cols and order identically
-    X = X[expected]
-    # sklearn may expect numpy array shape
-    return X
+    return X[expected]
 
-# ---------------- Lineups ----------------
-def best_lineup_by_minutes(team_id: int, season_str: str, top_n: int = 5):
+# ---------------- Spread / margin estimate ----------------
+def _learn_elo_to_margin(team_rows: pd.DataFrame, ds: pd.DataFrame) -> Tuple[float, float]:
+    """Fit margin ~ a * ELO_DIFF + b, using home PLUS_MINUS from the home team row."""
+    # home margin from team_rows (home row is the one with 'vs.')
+    home_rows = team_rows[team_rows["MATCHUP"].astype(str).str.contains(r"vs\.", regex=True, na=False)].copy()
+    margin_by_game = home_rows[["GAME_ID", "PLUS_MINUS"]].dropna()
+    elo_by_game = ds[["GAME_ID", "ELO_DIFF"]].drop_duplicates()
+    j = margin_by_game.merge(elo_by_game, on="GAME_ID", how="inner").dropna()
+    if len(j) < 50:
+        return (0.03, 0.0)  # fall back: ~0.03 pts of spread per Elo point (conservative)
+    x = j["ELO_DIFF"].to_numpy()
+    y = j["PLUS_MINUS"].to_numpy()
+    a, b = np.polyfit(x, y, 1)  # slope, intercept
+    return (float(a), float(b))
+
+def predict_spread_from_row(row: pd.DataFrame, team_rows: pd.DataFrame, ds: pd.DataFrame) -> float:
+    a, b = _learn_elo_to_margin(team_rows, ds)
+    elo_diff = float(row.iloc[0].get("ELO_DIFF", 0.0))
+    return a * elo_diff + b  # positive means HOME favored by that many points
+
+# ---------------- Lineups & top scorer ----------------
+def best_lineup_by_minutes(team_id: int, season_str: str, top_n: int = 5) -> List[str]:
     try:
         df = leaguedashplayerstats.LeagueDashPlayerStats(
             season=season_str, per_mode_detailed="PerGame", team_id_nullable=team_id
@@ -229,12 +251,57 @@ def best_lineup_by_minutes(team_id: int, season_str: str, top_n: int = 5):
     except Exception:
         return []
 
+def top_scorer_pick(team_id_a: int, team_id_b: int, season_str: str):
+    """Return (player_name, team_name, ppg, reason_text)."""
+    try:
+        A = leaguedashplayerstats.LeagueDashPlayerStats(
+            season=season_str, per_mode_detailed="PerGame", team_id_nullable=team_id_a
+        ).get_data_frames()[0][["PLAYER_NAME","PTS","MIN"]]
+        B = leaguedashplayerstats.LeagueDashPlayerStats(
+            season=season_str, per_mode_detailed="PerGame", team_id_nullable=team_id_b
+        ).get_data_frames()[0][["PLAYER_NAME","PTS","MIN"]]
+        A["TEAM"] = team_name(team_id_a); B["TEAM"] = team_name(team_id_b)
+        both = pd.concat([A,B], ignore_index=True).dropna(subset=["PTS"])
+        best = both.sort_values(["PTS","MIN"], ascending=[False,False]).iloc[0]
+        reason = f"{best['PLAYER_NAME']} leads these teams in season PPG ({best['PTS']:.1f})"
+        return str(best["PLAYER_NAME"]), str(best["TEAM"]), float(best["PTS"]), reason
+    except Exception:
+        return None, None, None, "Season player stats unavailable (API)."
+
+# ---------------- Reasons ----------------
+def reasons_from_row(row: pd.Series) -> List[str]:
+    rs = []
+    elo_diff = float(row.get("ELO_DIFF", 0.0))
+    if abs(elo_diff) >= 25:
+        side = "home" if elo_diff > 0 else "away"
+        rs.append(f"Elo edge favors {side} by {abs(elo_diff):.0f} rating pts.")
+
+    rest_diff = float(row.get("REST_DIFF", 0.0))
+    if abs(rest_diff) >= 0.5:
+        side = "home" if rest_diff > 0 else "away"
+        rs.append(f"{side.title()} rest advantage ~{abs(rest_diff):.1f} days.")
+
+    b2b_diff = float(row.get("B2B_DIFF", 0.0))
+    if abs(b2b_diff) >= 0.5:
+        side = "home" if b2b_diff < 0 else "away"  # fewer B2Bs is better
+        rs.append(f"Back-to-back differential favors {side}.")
+
+    # check any rolling net/pts diffs present
+    candidates = [c for c in row.index if ("NET" in c or "PTS" in c) and ("_DIFF_" in c)]
+    if candidates:
+        # pick largest absolute
+        c = max(candidates, key=lambda k: abs(float(row.get(k, 0.0))))
+        val = float(row.get(c, 0.0))
+        side = "home" if val > 0 else "away"
+        rs.append(f"Recent {c.replace('_',' ').lower()} leans {side} ({val:+.2f}).")
+    return rs[:3]
+
 # ---------------- Predict core ----------------
 def predict_from_text(query: str):
     home_txt, away_txt, dt, season_start, season_str = parse_query_text(query)
     hid, aid = fuzzy_team_id(home_txt), fuzzy_team_id(away_txt)
 
-    # Load dataset and build engineered game-level frame
+    # Build engineered dataset from CSV
     team_rows = load_team_rows_from_csv(DATA_CSV)
     ds = build_dataset(team_rows)
 
@@ -256,27 +323,29 @@ def predict_from_text(query: str):
         else:
             row = cand.sort_values("GAME_DATE").head(1).copy()
 
-    # If still empty → synthesize (future/unscheduled)
+    # If still empty → synthesize from latest form (future/unscheduled)
     if row.empty:
         row = synthesize_matchup_row(ds, hid, aid, dt)
         venue_used = "synthesized (latest form)"
 
     # Build features and align to training feature order
-    X = build_X_for_row(row)
-    kind, model, scaler = load_best_model()
+    X = build_X_for_row(row.copy())
+    kind, model, scaler, calibrator = load_best_model()   # <- note calibrator now
     X_aligned = align_to_model(X, model)
 
-    # Predict
+    # Predict prob (then apply isotonic if present)
     if kind == "lr" and scaler is not None:
         Xs = scaler.transform(X_aligned)
         p_home = float(model.predict_proba(Xs)[:, 1][0])
     else:
         p_home = float(model.predict_proba(X_aligned)[:, 1][0])
+    if calibrator is not None:
+        p_home = float(calibrator.predict([p_home])[0])
 
-    winner_id = hid if p_home >= 0.5 else aid
-    winner = team_name(winner_id)
+    # Predicted spread via Elo→margin regression
+    spread = predict_spread_from_row(row, team_rows, ds)  # +: home favored
 
-    # Season label for lineups
+    # Top-scorer pick (season of the game or last season in data)
     if dt:
         season_for_lineups = f"{dt.year-1}-{str(dt.year)[-2:]}"
     elif season_str:
@@ -289,10 +358,14 @@ def predict_from_text(query: str):
         except Exception:
             season_for_lineups = "2023-24"
 
-    home5 = best_lineup_by_minutes(hid, season_for_lineups)
-    away5 = best_lineup_by_minutes(aid, season_for_lineups)
+    ts_name, ts_team, ts_ppg, ts_reason = top_scorer_pick(hid, aid, season_for_lineups)
 
-    return {
+    # Winner
+    winner_id = hid if p_home >= 0.5 else aid
+    winner = team_name(winner_id)
+    reasons = reasons_from_row(row.iloc[0])
+
+    result = {
         "parsed": {
             "home": home_txt,
             "away": away_txt,
@@ -304,15 +377,61 @@ def predict_from_text(query: str):
             "home_team": team_name(hid),
             "away_team": team_name(aid),
             "home_win_prob": p_home,
-            "predicted_winner": winner
+            "predicted_winner": winner,
+            "predicted_spread_home": spread  # positive means home by N points
         },
-        "suggested_lineups_by_minutes": {
-            "home_top5": home5,
-            "away_top5": away5
-        }
+        "top_scorer": {
+            "player": ts_name, "team": ts_team, "season_ppg": ts_ppg, "why": ts_reason
+        },
+        "reasons": reasons
     }
+    return result
 
 # ---------------- CLI ----------------
+def print_pretty(res: dict):
+    ht = res["prediction"]["home_team"]
+    at = res["prediction"]["away_team"]
+    p = res["prediction"]["home_win_prob"]
+    spread = res["prediction"]["predicted_spread_home"]
+    winner = res["prediction"]["predicted_winner"]
+    ts = res["top_scorer"]
+
+    if not RICH:
+        # plain text fallback
+        print(f"{ht} vs {at}")
+        print(f"Home win prob: {p*100:.1f}%")
+        sign = "-" if spread >= 0 else "+"
+        print(f"Predicted spread: {ht} {sign}{abs(spread):.1f}")
+        print(f"Predicted winner: {winner}")
+        if ts["player"]:
+            print(f"Top scorer: {ts['player']} ({ts['team']}) ~ {ts['season_ppg']:.1f} ppg — {ts['why']}")
+        if res["reasons"]:
+            print("Reasons:")
+            for r in res["reasons"]:
+                print(f" - {r}")
+        return
+
+    table = Table(box=box.ROUNDED)
+    table.add_column("Home", style="bold")
+    table.add_column("Away", style="bold")
+    table.add_column("Win Prob (Home)")
+    table.add_column("Spread")
+    table.add_row(
+        ht, at, f"{p*100:.1f}%", f"{ht} {'-' if spread>=0 else '+'}{abs(spread):.1f}"
+    )
+    console.print(Panel(table, title="NBA ML — Game Prediction", expand=False))
+    console.print(f"[bold]Predicted Winner:[/bold] {winner}")
+
+    if ts["player"]:
+        console.print(
+            f"[bold]Top Scorer:[/bold] {ts['player']} ({ts['team']}) "
+            f"[dim]~ {ts['season_ppg']:.1f} ppg[/dim]\n[dim]{ts['why']}[/dim]"
+        )
+
+    if res["reasons"]:
+        bullets = "\n".join([f"• {r}" for r in res["reasons"]])
+        console.print(Panel(bullets, title="Why the model leans this way", expand=False))
+
 def main():
     if len(sys.argv) < 2:
         print('Usage:')
@@ -323,8 +442,12 @@ def main():
 
     query = parse_query(sys.argv[1:])
     try:
-        out = predict_from_text(query)
-        print(json.dumps(out, indent=2))
+        res = predict_from_text(query)
+        if RICH:
+            print_pretty(res)
+        else:
+            # default to pretty JSON if not using rich
+            print(json.dumps(res, indent=2))
     except Exception as e:
         print(f"Error: {e}")
         sys.exit(2)
