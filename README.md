@@ -32,54 +32,6 @@ This NBA ML system predicts game outcomes using a sophisticated feature engineer
 
 ## 🚀 Quick Start
 
-### Installation
-
-```bash
-# Clone the repository
-git clone <repository-url>
-cd nba-ml
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Install additional visualization dependencies
-pip install matplotlib seaborn
-```
-
-### Basic Usage
-
-#### 1. Make Predictions via CLI
-
-```bash
-# Predict a specific game
-python predict.py "Lakers vs Warriors 2024-12-25"
-
-# Predict with team abbreviations
-python predict.py "LAL vs GSW"
-
-# Predict for a specific season
-python predict.py "Celtics @ Heat 2025-2026 season"
-```
-
-#### 2. Start the Web API
-
-```bash
-# Start FastAPI server
-python app.py
-
-# Make API requests
-curl -X POST "http://localhost:8000/predict" \
-     -H "Content-Type: application/json" \
-     -d '{"query": "Lakers vs Warriors 2024-12-25"}'
-```
-
-#### 3. Run Benchmark Analysis
-
-```bash
-# Generate comprehensive performance analysis
-python benchmark.py
-```
-
 ## 🏗️ Architecture
 
 ### Feature Engineering Pipeline
@@ -225,53 +177,6 @@ pytest tests/test_shapes.py
 pytest --cov=. tests/
 ```
 
-## 📁 Project Structure
-
-```
-nba-ml/
-├── app.py                 # FastAPI web service
-├── predict.py            # CLI prediction interface
-├── train.py              # Logistic regression training
-├── train_hgb.py          # HistGradientBoosting training
-├── train_xgb.py          # XGBoost training
-├── features.py           # Feature engineering pipeline
-├── benchmark.py          # Performance benchmarking suite
-├── data_fetch.py         # NBA API data collection
-├── streamlit_app.py      # Streamlit web interface
-├── cli.py               # Command-line interface
-├── artifacts/           # Model artifacts and metrics
-│   ├── model.joblib     # Logistic regression model
-│   ├── hgb_model.joblib # HistGradientBoosting model
-│   ├── xgb_model.joblib # XGBoost model
-│   ├── metrics.json     # Performance metrics
-│   └── ...
-├── data/                # Game data
-│   └── games.csv        # Historical game data
-├── tests/               # Test suite
-└── requirements.txt     # Python dependencies
-```
-
-## 🎯 Key Insights & Recommendations
-
-### Model Performance Analysis
-- **Logistic Regression** performs best with 63.5% accuracy
-- **Feature Engineering** is crucial - rolling statistics and Elo ratings are key
-- **Temporal Validation** ensures realistic performance estimates
-- **Calibration** improves probability estimates for betting applications
-
-### Production Recommendations
-1. **Use Logistic Regression** for production deployments
-2. **Implement Real-time Updates** for Elo ratings during the season
-3. **Add Ensemble Methods** to combine multiple models
-4. **Monitor Performance** with live game outcome tracking
-5. **Expand Features** with player-level statistics and injury data
-
-### Future Enhancements
-- **Player-level Features**: Individual player statistics and matchups
-- **Injury Data**: Player availability and health status
-- **Weather Data**: Arena conditions and travel factors
-- **Betting Market Data**: Vegas odds integration
-- **Advanced Analytics**: Four factors, pace, and efficiency metrics
 
 ## 📊 Benchmark Results Summary
 
@@ -285,17 +190,6 @@ The NBA ML system demonstrates strong predictive performance:
 
 The system outperforms random guessing (50%) by 13.5 percentage points and provides reliable probability estimates for game outcomes.
 
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Add tests for new functionality
-4. Run the benchmark suite
-5. Submit a pull request
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## 🙏 Acknowledgments
 
@@ -303,7 +197,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - Scikit-learn for machine learning algorithms
 - FastAPI for web service framework
 - The basketball analytics community for feature engineering insights
-
----
-
-**Built with ❤️ for basketball analytics and machine learning enthusiasts**
